@@ -46,11 +46,11 @@ clean:
 	@rm -rf $(TARGET).skprx $(TARGET).velf $(TARGET).elf $(OBJS) $(DEPS)
 
 send: $(TARGET).skprx
-	curl -T $(TARGET).skprx ftp://$(PSVITAIP):1337/ux0:/data/tai/kplugin.skprx
+	curl -T $(TARGET).skprx ftp://$(PSVITAIP):1337/ur0:/tai/udcd_uvc.skprx
 	@echo "Sent."
 
 launch: send
-	echo "load_skprx ux0:/data/tai/kplugin.skprx" | nc $(PSVITAIP) 1338
+	echo "load_skprx ur0:/tai/udcd_uvc.skprx" | nc $(PSVITAIP) 1338
 	@echo "Launched!"
 
 taisend: $(TARGET).skprx

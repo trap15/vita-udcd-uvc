@@ -7,6 +7,8 @@ static char log_buf[16 * 1024];
 
 void log_reset()
 {
+	ksceIoMkdir(LOG_PATH, 6);
+
 	SceUID fd = ksceIoOpen(LOG_FILE,
 		SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
 	if (fd < 0)

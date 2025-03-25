@@ -10,6 +10,10 @@
 #include "draw.h"
 #include "log.h"
 
+#define ksceKernelCpuDcacheAndL2WritebackInvalidateRange ksceKernelDcacheCleanInvalidateRange
+#define ksceKernelCpuDcacheAndL2WritebackRange ksceKernelDcacheCleanRange
+#define ksceKernelCpuDcacheWritebackRange ksceKernelDcacheCleanRangeForL1WBWA
+
 #define ALIGN(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 
 extern const unsigned char msx_font[];

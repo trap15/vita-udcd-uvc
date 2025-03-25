@@ -10,6 +10,9 @@
 #include "usb_descriptors.h"
 #include "uvc.h"
 
+#define ksceKernelCpuDcacheAndL2WritebackInvalidateRange ksceKernelDcacheCleanInvalidateRange
+#define ksceKernelCpuDcacheAndL2WritebackRange ksceKernelDcacheCleanRange
+
 #ifdef DEBUG
 
 #include "log.h"
@@ -20,8 +23,8 @@
 	do { \
 		char __buffer[128]; \
 		snprintf(__buffer, sizeof(__buffer), s, ##__VA_ARGS__); \
-		/*LOG_TO_FILE(__buffer);*/ \
-		console_print(__buffer); \
+		LOG_TO_FILE(__buffer); \
+		/*console_print(__buffer);*/ \
 	} while (0)
 #else
 #define LOG(...) (void)0
@@ -165,7 +168,7 @@ static int usb_ep0_enqueue_recv_for_req(const SceUdcdEP0DeviceRequest *ep0_req)
 		.physicalAddress = NULL
 	};
 
-	ksceKernelDcacheInvalidateRange(pending_recv.buffer,
+	ksceKernelCpuDcacheAndL2WritebackInvalidateRange(pending_recv.buffer,
 		pending_recv.ep0_req.wLength);
 
 	return ksceUdcdReqRecv(&req);
@@ -310,8 +313,6 @@ static void uvc_handle_video_streaming_req(const SceUdcdEP0DeviceRequest *req)
 			LOG("Probe GET_CUR, bFormatIndex: %d, bmFramingInfo: %x\n",
 			    uvc_probe_control_setting.bFormatIndex,
 			    uvc_probe_control_setting.bmFramingInfo);
-			ksceKernelDcacheCleanRange(&uvc_probe_control_setting,
-					 sizeof(uvc_probe_control_setting));
 			usb_ep0_req_send(&uvc_probe_control_setting,
 					 sizeof(uvc_probe_control_setting));
 			break;
@@ -327,8 +328,6 @@ static void uvc_handle_video_streaming_req(const SceUdcdEP0DeviceRequest *req)
 		case UVC_GET_LEN:
 			break;
 		case UVC_GET_CUR:
-			ksceKernelDcacheCleanRange(&uvc_probe_control_setting,
-					 sizeof(uvc_probe_control_setting));
 			usb_ep0_req_send(&uvc_probe_control_setting,
 					 sizeof(uvc_probe_control_setting));
 			break;
@@ -862,12 +861,10 @@ int uvc_start(void)
 	 */
 	ksceDisplayWaitSetFrameBufCB();
 
-#ifndef DEBUG
 	/*
 	 * Wait until LiveArea is more or less ready.
 	 */
 	ksceKernelDelayThreadCB(15 * 1000 * 1000);
-#endif
 
 	ret = ksceUdcdDeactivate();
 	if (ret < 0 && ret != SCE_UDCD_ERROR_INVALID_ARGUMENT) {
@@ -960,7 +957,7 @@ static int SceUdcd_sub_01E1128C_hook_func(const SceUdcdConfigDescriptor *config_
 
 		dst->wTotalLength += sizeof(interface_association_descriptor);
 
-		ksceKernelDcacheCleanRange(desc_data, dst->wTotalLength);
+		ksceKernelCpuDcacheAndL2WritebackRange(desc_data, dst->wTotalLength);
 	}
 
 	return ret;
@@ -975,8 +972,8 @@ int module_start(SceSize argc, const void *args)
 
 #ifdef DEBUG
 	log_reset();
-	framebuffer_map();
-	console_init();
+	//framebuffer_map();
+	//console_init();
 #endif
 
 	LOG("udcd_uvc by xerpi\n");
@@ -1051,8 +1048,8 @@ int module_stop(SceSize argc, const void *args)
 	}
 
 #ifdef DEBUG
-	console_fini();
-	framebuffer_unmap();
+	//console_fini();
+	//framebuffer_unmap();
 	log_flush();
 #endif
 

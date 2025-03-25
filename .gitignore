@@ -1,0 +1,5 @@
+*.skprx
+*.d
+*.o
+*.elf
+*.velf
