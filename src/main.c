@@ -24,6 +24,7 @@
 		char __buffer[128]; \
 		snprintf(__buffer, sizeof(__buffer), s, ##__VA_ARGS__); \
 		LOG_TO_FILE(__buffer); \
+		log_flush(); \
 		/*console_print(__buffer);*/ \
 	} while (0)
 #else
@@ -36,7 +37,18 @@
 #define UVC_DRIVER_NAME			"VITAUVC00"
 #define UVC_USB_PID			0x1337
 
-#define MAX_UVC_VIDEO_FRAME_SIZE	VIDEO_FRAME_SIZE_NV12(1280, 720)
+// Encodes and sends frames in separate threads, allowing overlap
+// This unfortunately requires double the framebuffer memory, otherwise they
+// may collide with each other.
+#define ENCODE_SEND_PARALLELIZE 1
+
+#if ENCODE_SEND_PARALLELIZE
+# define UVC_FRAMEBUFFER_COUNT 2
+#else
+# define UVC_FRAMEBUFFER_COUNT 1
+#endif
+
+#define MAX_UVC_VIDEO_FRAME_SIZE	VIDEO_FRAME_SIZE_NV12(960, 544)
 
 #define UVC_PAYLOAD_HEADER_SIZE		12
 #define UVC_PAYLOAD_SIZE(frame_size)	(UVC_PAYLOAD_HEADER_SIZE + (frame_size))
@@ -109,17 +121,25 @@ static struct {
 	SceUdcdEP0DeviceRequest ep0_req;
 } pending_recv;
 
-static SceUID uvc_thread_id;
-static SceUID uvc_event_flag_id;
+typedef struct {
+	int fb_idx;
+	int frame_size;
+	int format_idx;
+} NextTransferState;
+
+static SceUID uvc_convert_thread_id;
+static SceUID eventflag_srcfb_ready;
+#if ENCODE_SEND_PARALLELIZE
+static SceUID uvc_send_thread_id;
+static SceUID eventflag_dstfb_ready;
+#endif
+static volatile NextTransferState next_xfer;
 static int uvc_thread_run;
 static int stream;
 
-static SceUID uvc_frame_buffer_uid = -1;
-static struct uvc_frame *uvc_frame_buffer_addr;
+static volatile SceUID uvc_frame_buffer_uid[UVC_FRAMEBUFFER_COUNT] = { -1, -1 };
+static struct uvc_frame *uvc_frame_buffer_addr[UVC_FRAMEBUFFER_COUNT];
 SceUID uvc_frame_req_evflag;
-
-static int uvc_frame_init(unsigned int size);
-static int uvc_frame_term();
 
 #if defined(DISPLAY_OFF_OLED) || defined(DISPLAY_OFF_LCD)
 static int prev_brightness;
@@ -258,7 +278,7 @@ static void uvc_handle_video_streaming_req_recv(const SceUdcdEP0DeviceRequest *r
 			    uvc_probe_control_setting.bmFramingInfo);
 
 			stream = 1;
-			ksceKernelSetEventFlag(uvc_event_flag_id, 1);
+			ksceKernelSetEventFlag(eventflag_srcfb_ready, 1);
 			break;
 		}
 		break;
@@ -575,8 +595,7 @@ static inline unsigned int display_pixelformat_bpp(unsigned int fmt)
 	}
 }
 
-static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
-					int dst_width, int dst_height)
+static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info, int dst_width, int dst_height)
 {
 	uintptr_t dst_paddr;
 	uintptr_t src_paddr = fb_info->paddr;
@@ -586,7 +605,7 @@ static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
 	unsigned int src_height = fb_info->framebuf.height;
 	unsigned int src_pixelfmt = fb_info->framebuf.pixelformat;
 	unsigned int src_pixelfmt_bpp = display_pixelformat_bpp(src_pixelfmt);
-	unsigned char *uvc_frame_data = uvc_frame_buffer_addr->data;
+	unsigned char *uvc_frame_data = uvc_frame_buffer_addr[fid]->data;
 
 	static SceIftuCscParams RGB_to_YCbCr_JPEG_csc_params = {
 		0, 0x202, 0x3FF,
@@ -648,39 +667,8 @@ static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
 	return ksceIftuCsc(&dst, (SceIftuPlaneState *)&src, &params);
 }
 
-static int convert_and_send_frame_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
-					int dst_width, int dst_height)
+static int convert_frame(void)
 {
-	int ret;
-	uint64_t time1, time2, time3;
-	UNUSED(time1);
-	UNUSED(time2);
-	UNUSED(time3);
-
-	time1 = ksceKernelGetSystemTimeWide();
-
-	ret = frame_convert_to_nv12(fid, fb_info, dst_width, dst_height);
-	if (ret < 0)
-		return ret;
-
-	time2 = ksceKernelGetSystemTimeWide();
-
-	ret = uvc_frame_transfer(uvc_frame_buffer_addr,
-				 UVC_PAYLOAD_SIZE(VIDEO_FRAME_SIZE_NV12(dst_width, dst_height)),
-				 fid, 1);
-	if (ret < 0)
-		return ret;
-
-	time3 = ksceKernelGetSystemTimeWide();
-	LOG("NV12 CSC: %lldus xfer: %lldus\n", time2 - time1, time3 - time2);
-
-	return 0;
-}
-
-static int send_frame(void)
-{
-	static int fid = 0;
-
 	int ret;
 	SceDisplayFrameBufInfo fb_info;
 	int head = ksceDisplayGetPrimaryHead();
@@ -694,37 +682,51 @@ static int send_frame(void)
 		return ret;
 
 	switch (uvc_probe_control_setting.bFormatIndex) {
-	case FORMAT_INDEX_UNCOMPRESSED_NV12: {
-		const struct UVC_FRAME_UNCOMPRESSED(2) *frames =
-			video_streaming_descriptors.frames_uncompressed_nv12;
-		int cur_frame_index = uvc_probe_control_setting.bFrameIndex;
-		int dst_width = frames[cur_frame_index - 1].wWidth;
-		int dst_height = frames[cur_frame_index - 1].wHeight;
+		case FORMAT_INDEX_UNCOMPRESSED_NV12: {
+			const struct UVC_FRAME_UNCOMPRESSED(2) *frames =
+				video_streaming_descriptors.frames_uncompressed_nv12;
+			int cur_frame_index = uvc_probe_control_setting.bFrameIndex;
+			int dst_width = frames[cur_frame_index - 1].wWidth;
+			int dst_height = frames[cur_frame_index - 1].wHeight;
 
-		static int last_frame_index = 0;
-		if (uvc_frame_buffer_uid < 0 || cur_frame_index != last_frame_index) {
-			uvc_frame_term();
-			ret = uvc_frame_init(UVC_FRAME_PADDING_SIZE + VIDEO_FRAME_SIZE_NV12(dst_width, dst_height));
+			NextTransferState now_xfer = next_xfer;
+			now_xfer.frame_size = VIDEO_FRAME_SIZE_NV12(dst_width, dst_height);
+			now_xfer.fb_idx = (now_xfer.fb_idx + 1) & (UVC_FRAMEBUFFER_COUNT - 1);
+
+			ret = frame_convert_to_nv12(now_xfer.fb_idx, &fb_info, dst_width, dst_height);
 			if (ret < 0) {
-				LOG("Error allocating the UVC frame (0x%08X)\n", ret);
+				LOG("Error converting NV12 frame: 0x%08X\n", ret);
 				return ret;
-			} else {
-				last_frame_index = cur_frame_index;
 			}
-		}
+			next_xfer = now_xfer;
 
-		ret = convert_and_send_frame_nv12(fid, &fb_info, dst_width, dst_height);
-		if (ret < 0) {
-			LOG("Error sending NV12 frame: 0x%08X\n", ret);
-			return ret;
+			break;
 		}
-
-		break;
-	}
 	}
 
+#if ENCODE_SEND_PARALLELIZE
+	ksceKernelSetEventFlag(eventflag_dstfb_ready, 1);
+#endif
+
+	return 0;
+}
+
+static int send_frame(void)
+{
+	static int fid = 0;
+
+	int ret;
+
+	NextTransferState now_xfer = next_xfer;
+
+	if (uvc_frame_buffer_uid[now_xfer.fb_idx] < 0) {
+		return -1;
+	}
+
+	ret = uvc_frame_transfer(uvc_frame_buffer_addr[now_xfer.fb_idx],
+				 				UVC_PAYLOAD_SIZE(now_xfer.frame_size), fid, 1);
 	if (ret < 0) {
-		stream = 0;
+		LOG("Error sending frame: 0x%08X\n", ret);
 		return ret;
 	}
 
@@ -750,14 +752,14 @@ static int display_vblank_cb_func(int notifyId, int notifyCount, int notifyArg, 
 	elapsed = FPS_TO_INTERVAL(60 / frames);
 
 	if (elapsed >= uvc_probe_control_setting.dwFrameInterval) {
-		ksceKernelSetEventFlag(uvc_event_flag_id, 1);
+		ksceKernelSetEventFlag(eventflag_srcfb_ready, 1);
 		frames = 0;
 	}
 
 	return 0;
 }
 
-static int uvc_thread(SceSize args, void *argp)
+static int uvc_convert_thread(SceSize args, void *argp)
 {
 	SceUID display_vblank_cb_uid;
 #if 0
@@ -772,8 +774,10 @@ static int uvc_thread(SceSize args, void *argp)
 	ksceKernelDelayThread(250 * 1000);
 #endif
 
+#if !ENCODE_SEND_PARALLELIZE
 	stream = 0;
 	uvc_start();
+#endif
 
 	display_vblank_cb_uid = ksceKernelCreateCallback("uvc_display_vblank", 0,
 							 display_vblank_cb_func, NULL);
@@ -783,20 +787,66 @@ static int uvc_thread(SceSize args, void *argp)
 	while (uvc_thread_run) {
 		unsigned int out_bits;
 
-		int ret = ksceKernelWaitEventFlagCB(uvc_event_flag_id, 1,
+		int ret = ksceKernelWaitEventFlagCB(eventflag_srcfb_ready, 1,
 			SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
 			&out_bits, (SceUInt32[]){1000000});
 
 		if (ret == 0 && stream)
+		{
+			convert_frame();
+#if !ENCODE_SEND_PARALLELIZE
 			send_frame();
+#endif
+		}
 		else if (ret == 0x80028005) /* SCE_KERNEL_ERROR_WAIT_TIMEOUT */
-			uvc_frame_term();
+		{
+			continue;
+		}
 	}
 
 	ksceDisplayUnregisterVblankStartCallback(display_vblank_cb_uid);
 	ksceKernelDeleteCallback(display_vblank_cb_uid);
 
+#if !ENCODE_SEND_PARALLELIZE
 	uvc_stop();
+#endif
+
+	return 0;
+}
+
+#if ENCODE_SEND_PARALLELIZE
+static int uvc_send_thread(SceSize args, void *argp)
+{
+	stream = 0;
+	uvc_start();
+
+	ksceKernelSetEventFlag(eventflag_srcfb_ready, 1);
+
+	while (uvc_thread_run) {
+		unsigned int out_bits;
+
+		int ret = ksceKernelWaitEventFlagCB(eventflag_dstfb_ready, 1,
+			SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
+			&out_bits, (SceUInt32[]){1000000});
+
+		if (ret == 0 && stream)
+			send_frame();
+	}
+
+	uvc_stop();
+
+	return 0;
+}
+#endif
+
+static int uvc_frame_term(void)
+{
+	for(int i = 0; i < UVC_FRAMEBUFFER_COUNT; i++) {
+		if (uvc_frame_buffer_uid[i] >= 0) {
+			ksceKernelFreeMemBlock(uvc_frame_buffer_uid[i]);
+			uvc_frame_buffer_uid[i] = -1;
+		}
+	}
 
 	return 0;
 }
@@ -805,48 +855,39 @@ static int uvc_frame_init(unsigned int size)
 {
 	int ret;
 
+	// ensure we're not leaking
+	uvc_frame_term();
+
 	const int use_cdram = 0;
 	SceKernelAllocMemBlockKernelOpt opt;
 	SceKernelMemBlockType type;
 	SceKernelAllocMemBlockKernelOpt *optp;
 
 	if (use_cdram) {
-		type = 0x40408006;
+		type = SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_CDRAM_RW;
 		size = ALIGN(size, 256 * 1024);
 		optp = NULL;
 	} else {
-		type = 0x10208006;
+		type = SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_NC_RW;
 		size = ALIGN(size, 4 * 1024);
 		memset(&opt, 0, sizeof(opt));
-		opt.size = sizeof(opt);
-		opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT |
-			   SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
-		opt.alignment = 4 * 1024;
-		optp = &opt;
+		optp = NULL;
 	}
 
-	uvc_frame_buffer_uid = ksceKernelAllocMemBlock("uvc_frame_buffer", type, size, optp);
-	if (uvc_frame_buffer_uid < 0) {
-		LOG("Error allocating CSC dest memory: 0x%08X\n", uvc_frame_buffer_uid);
-		return uvc_frame_buffer_uid;
-	}
+	for(int i = 0; i < UVC_FRAMEBUFFER_COUNT; i++) {
+		uvc_frame_buffer_uid[i] = ksceKernelAllocMemBlock("uvc_frame_buffer", type, size, optp);
+		if (uvc_frame_buffer_uid[i] < 0) {
+			LOG("Error allocating CSC%d dest memory: 0x%08X\n", i, uvc_frame_buffer_uid[i]);
+			return uvc_frame_buffer_uid[i];
+		}
 
-	ret = ksceKernelGetMemBlockBase(uvc_frame_buffer_uid, (void **)&uvc_frame_buffer_addr);
-	if (ret < 0) {
-		LOG("Error getting CSC desr memory addr: 0x%08X\n", ret);
-		ksceKernelFreeMemBlock(uvc_frame_buffer_uid);
-		uvc_frame_buffer_uid = -1;
-		return ret;
-	}
-
-	return 0;
-}
-
-static int uvc_frame_term()
-{
-	if (uvc_frame_buffer_uid >= 0) {
-		ksceKernelFreeMemBlock(uvc_frame_buffer_uid);
-		uvc_frame_buffer_uid = -1;
+		ret = ksceKernelGetMemBlockBase(uvc_frame_buffer_uid[i], (void **)&uvc_frame_buffer_addr[i]);
+		if (ret < 0) {
+			LOG("Error getting CSC%d desr memory addr: 0x%08X\n", i, ret);
+			ksceKernelFreeMemBlock(uvc_frame_buffer_uid[i]);
+			uvc_frame_buffer_uid[i] = -1;
+			return ret;
+		}
 	}
 
 	return 0;
@@ -894,6 +935,8 @@ int uvc_start(void)
 		LOG("Error activating the " UVC_DRIVER_NAME " driver (0x%08X)\n", ret);
 		goto err_activate;
 	}
+
+	uvc_frame_init(UVC_FRAME_PADDING_SIZE + MAX_UVC_VIDEO_FRAME_SIZE);
 
 	ret = uvc_frame_req_init();
 	if (ret < 0) {
@@ -985,19 +1028,33 @@ int module_start(SceSize argc, const void *args)
 		&SceUdcd_sub_01E1128C_ref, SceUdcd_modinfo.modid, 0,
 		0x01E1128C - 0x01E10000, 1, SceUdcd_sub_01E1128C_hook_func);
 
-	uvc_thread_id = ksceKernelCreateThread("uvc_thread", uvc_thread,
-					       0x3C, 0x1000, 0, 0x10000, 0);
-	if (uvc_thread_id < 0) {
-		LOG("Error creating the UVC thread (0x%08X)\n", uvc_thread_id);
+	uvc_convert_thread_id = ksceKernelCreateThread("uvc_convert_thread", uvc_convert_thread, 0x3C, 0x1000, 0, 0x10000, 0);
+	if (uvc_convert_thread_id < 0) {
+		LOG("Error creating the UVC convert thread (0x%08X)\n", uvc_convert_thread_id);
 		goto err_return;
 	}
 
-	uvc_event_flag_id = ksceKernelCreateEventFlag("uvc_event_flag", 0,
-						      0, NULL);
-	if (uvc_event_flag_id < 0) {
-		LOG("Error creating the UVC event flag (0x%08X)\n", uvc_event_flag_id);
+#if ENCODE_SEND_PARALLELIZE
+	uvc_send_thread_id = ksceKernelCreateThread("uvc_send_thread", uvc_send_thread, 0x3C, 0x1000, 0, 0x10000, 0);
+	if (uvc_send_thread_id < 0) {
+		LOG("Error creating the UVC send thread (0x%08X)\n", uvc_send_thread_id);
+		goto err_return;
+	}
+#endif
+
+	eventflag_srcfb_ready = ksceKernelCreateEventFlag("eventflag_srcfb_ready", 0, 0, NULL);
+	if (eventflag_srcfb_ready < 0) {
+		LOG("Error creating the UVC srcfb event flag (0x%08X)\n", eventflag_srcfb_ready);
 		goto err_destroy_thread;
 	}
+
+#if ENCODE_SEND_PARALLELIZE
+	eventflag_dstfb_ready = ksceKernelCreateEventFlag("eventflag_dstfb_ready", 0, 0, NULL);
+	if (eventflag_dstfb_ready < 0) {
+		LOG("Error creating the UVC srcfb event flag (0x%08X)\n", eventflag_dstfb_ready);
+		goto err_destroy_thread;
+	}
+#endif
 
 	ret = ksceUdcdRegister(&uvc_udcd_driver);
 	if (ret < 0) {
@@ -1007,9 +1064,22 @@ int module_start(SceSize argc, const void *args)
 
 	uvc_thread_run = 1;
 
-	ret = ksceKernelStartThread(uvc_thread_id, 0, NULL);
+#if ENCODE_SEND_PARALLELIZE
+	ret = ksceKernelStartThread(uvc_send_thread_id, 0, NULL);
 	if (ret < 0) {
-		LOG("Error starting the UVC thread (0x%08X)\n", ret);
+		LOG("Error starting the UVC send thread (0x%08X)\n", ret);
+		goto err_unregister;
+	}
+
+	unsigned int out_bits;
+	ksceKernelWaitEventFlagCB(eventflag_srcfb_ready, 1,
+		SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
+		&out_bits, (SceUInt32[]){1000000});
+#endif
+
+	ret = ksceKernelStartThread(uvc_convert_thread_id, 0, NULL);
+	if (ret < 0) {
+		LOG("Error starting the UVC convert thread (0x%08X)\n", ret);
 		goto err_unregister;
 	}
 
@@ -1018,9 +1088,15 @@ int module_start(SceSize argc, const void *args)
 err_unregister:
 	ksceUdcdUnregister(&uvc_udcd_driver);
 err_delete_event_flag:
-	ksceKernelDeleteEventFlag(uvc_event_flag_id);
+	ksceKernelDeleteEventFlag(eventflag_srcfb_ready);
+#if ENCODE_SEND_PARALLELIZE
+	ksceKernelDeleteEventFlag(eventflag_dstfb_ready);
+#endif
 err_destroy_thread:
-	ksceKernelDeleteThread(uvc_thread_id);
+	ksceKernelDeleteThread(uvc_convert_thread_id);
+#if ENCODE_SEND_PARALLELIZE
+	ksceKernelDeleteThread(uvc_send_thread_id);
+#endif
 err_return:
 	return SCE_KERNEL_START_FAILED;
 }
@@ -1029,11 +1105,19 @@ int module_stop(SceSize argc, const void *args)
 {
 	uvc_thread_run = 0;
 
-	ksceKernelSetEventFlag(uvc_event_flag_id, 1);
-	ksceKernelWaitThreadEnd(uvc_thread_id, NULL, NULL);
+	ksceKernelSetEventFlag(eventflag_srcfb_ready, 1);
+	ksceKernelWaitThreadEnd(uvc_convert_thread_id, NULL, NULL);
+#if ENCODE_SEND_PARALLELIZE
+	ksceKernelSetEventFlag(eventflag_dstfb_ready, 1);
+	ksceKernelWaitThreadEnd(uvc_send_thread_id, NULL, NULL);
+#endif
 
-	ksceKernelDeleteEventFlag(uvc_event_flag_id);
-	ksceKernelDeleteThread(uvc_thread_id);
+	ksceKernelDeleteEventFlag(eventflag_srcfb_ready);
+	ksceKernelDeleteThread(uvc_convert_thread_id);
+#if ENCODE_SEND_PARALLELIZE
+	ksceKernelDeleteEventFlag(eventflag_dstfb_ready);
+	ksceKernelDeleteThread(uvc_send_thread_id);
+#endif
 
 	uvc_frame_req_fini();
 

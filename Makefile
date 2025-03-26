@@ -3,12 +3,12 @@ OBJS	= src/main.o
 LIBS	= -lSceSysmemForDriver_stub -lSceThreadmgrForDriver_stub \
 	-lSceCpuForDriver_stub -lSceUdcdForDriver_stub \
 	-lSceDisplayForDriver_stub -lSceIftuForDriver_stub \
-	-ltaihenForKernel_stub
+	-ltaihenForKernel_stub -lSceSysclibForDriver_stub
 
 ifeq ($(DEBUG), 1)
 	OBJS	+= debug/log.o debug/draw.o debug/console.o debug/font_data.o
 	CFLAGS	+= -DDEBUG -Idebug
-	LIBS	+= -lSceSysclibForDriver_stub -lSceIofilemgrForDriver_stub
+	LIBS	+= -lSceIofilemgrForDriver_stub
 endif
 
 ifeq ($(DISPLAY_OFF_OLED), 1)
@@ -23,7 +23,7 @@ endif
 
 PREFIX	= arm-vita-eabi
 CC	= $(PREFIX)-gcc
-CFLAGS	+= -Wl,-q -Wall -O2 -nostartfiles -mcpu=cortex-a9 -mthumb-interwork -Iinclude
+CFLAGS	+= -Wl,-q -Wall -O3 -fomit-frame-pointer -nostartfiles -mcpu=cortex-a9 -mthumb-interwork -Iinclude
 DEPS	= $(OBJS:.o=.d)
 
 all: $(TARGET).skprx
